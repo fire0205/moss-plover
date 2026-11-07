@@ -534,8 +534,8 @@ class StagePlan:
     outline_fit: bool = False
     # The same fit, applied only to the finished module: the chain runs without it.
     outline_fit_last: bool = False
-    # Rule B before the final pick (see Pipeline.checkpoint_picks): each lineage may go back to its module after this step
-    # (0-based) or a later one. -1 = off: every lineage goes to the final pick with its last module.
+    # Rule B after the final pick (see Pipeline.checkpoint_picks): the winning lineage may go back to its module after this
+    # step (0-based) or a later one. -1 = off: the winner ships with its last module.
     checkpoint_from: int = -1
 
 
@@ -955,9 +955,9 @@ class Pipeline:
 
     def checkpoint_picks(self, plan: StagePlan, checkpoints: list[list[Candidate]],
                          survivors: list[Candidate]) -> list[Candidate]:
-        """Rule B (path minimum) on each lineage's last checkpoints, before the final pick. Checkpoint 0 is the lineage's
-        module after step `plan.checkpoint_from`, then one per later step. Uses only the step selections' saved scores
-        (no call). A lineage with anything unknown keeps its last module."""
+        """Rule B (path minimum) on each lineage's last checkpoints; run_stages takes the final pick's lineage only.
+        Checkpoint 0 is the lineage's module after step `plan.checkpoint_from`, then one per later step. Uses only the
+        step selections' saved scores (no call). A lineage with anything unknown keeps its last module."""
         self.checkpoint_log = []
         try:
             first = plan.checkpoint_from
@@ -1092,10 +1092,10 @@ class Pipeline:
                 if plan.measured and len(survivors) == 1 and not searched:  # once only: the Pod has one render slot
                     survivors[0], searched = self.posed_by_search(pool, survivors[0]), True
                 checkpoints.append(list(survivors))
-            if plan.checkpoint_from >= 0:
-                survivors = self.checkpoint_picks(plan, checkpoints, survivors)
-                self.best_so_far = survivors[0].source
             winner = self.select(pool, survivors, set(), 1, FINAL_SELECT_ID)[0]
+            if plan.checkpoint_from >= 0:  # the final pick stays as it was; rule B then works inside the winner's lineage
+                picked = self.checkpoint_picks(plan, checkpoints, survivors)
+                winner = next((p for s, p in zip(survivors, picked) if s is winner), winner)
             self.best_so_far = winner.source
             final = self.posed(pool, winner) if plan.pose and not plan.measured else winner
             return self.stronger_metal(self.photo_tilted(self.fitted_last(winner, plan)) if plan.outline_fit_last and final is winner else final.source)

@@ -1,4 +1,4 @@
-"""The plan this submission runs: r70a = r68a with the checkpoint pick (rule B) on steps 4-6 before the final pick."""
+"""The plan this submission runs: r68a with the checkpoint pick (rule B) on steps 4-6 of the final pick's lineage."""
 
 from __future__ import annotations
 

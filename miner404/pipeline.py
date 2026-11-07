@@ -69,6 +69,8 @@ REPAIR_OFFSET = 5000
 SELECT_ID = 9000  # plus 10 * (step + 1); the mirrored call takes the next id
 FINAL_SELECT_ID = 9800
 POSE_ID = 9900
+POST_PICK_STEPS = 3  # rewrites of the final pick (steps 7-9: rewrite 700/800/900, selection 9070/9080/9090)
+POST_PICK_REWRITE = (SOL, "xhigh")  # the rewrite of the plan's last step
 METAL_PASS = 'const __m404 = new Set(); root.traverse((o) => { const list = o.material ? (Array.isArray(o.material) ? o.material : [o.material]) : []; for (const m of list) { if (__m404.has(m)) continue; __m404.add(m); if (m.metalness !== undefined && m.metalness >= 0.25) { m.metalness = 0.8; m.roughness = 0.2; } } });'
 BRIEF_ID = 9990
 BRIEF_MAX_OUTPUT = 4096
@@ -534,9 +536,6 @@ class StagePlan:
     outline_fit: bool = False
     # The same fit, applied only to the finished module: the chain runs without it.
     outline_fit_last: bool = False
-    # Rule B after the final pick (see Pipeline.checkpoint_picks): the winning lineage may go back to its module after this
-    # step (0-based) or a later one. -1 = off: the winner ships with its last module.
-    checkpoint_from: int = -1
 
 
 @dataclass
@@ -581,69 +580,6 @@ def views_match(shown: list[bytes], chosen: list[bytes], limit: float = 8.0) -> 
     return True
 
 
-VIEW_KEYS = ("front_left", "front_right", "front_below", "front_above")
-
-
-def view_penalties(labels: dict[str, Candidate], replies: list[Response | None]) -> list[dict[str, tuple[int, ...]]]:
-    """Each reply's four front-view penalties by candidate name, one dict per reply in reply order, read as
-    parse_judgement reads them (first entry per label, each penalty clamped to 0..10). An entry that does not parse
-    whole, and a reply that does not parse, give nothing. Never raises."""
-    out: list[dict[str, tuple[int, ...]]] = []
-    for reply in replies:
-        found: dict[str, tuple[int, ...]] = {}
-        out.append(found)
-        try:
-            entries = json.loads(reply.output_text)["candidates"] if reply is not None else []
-            seen: set[str] = set()
-            for entry in entries:
-                try:
-                    label = entry.get("label")
-                    if label not in labels or label in seen:
-                        continue
-                    seen.add(label)
-                    views = tuple(min(10, max(0, int(entry[k]))) for k in VIEW_KEYS)
-                    int(entry["garbage_sides"])
-                    if "grid" in entry:
-                        int(entry["grid"])
-                    found[labels[label].name] = views
-                except Exception:  # noqa: BLE001 - this entry gives nothing
-                    continue
-        except Exception:  # noqa: BLE001 - this reply gives nothing
-            continue
-    return out
-
-
-def front_means(replies: list[dict[str, tuple[int, ...]]], parent: str, child: str) -> tuple[float, float] | None:
-    """The parent's and the child's mean front-view penalty in one selection: the mean over the replies that scored
-    both of each reply's mean of four views. None when no reply scored both."""
-    pairs = [(reply[parent], reply[child]) for reply in replies if parent in reply and child in reply]
-    if not pairs or any(len(p) != 4 or len(c) != 4 for p, c in pairs):
-        return None
-    return (sum(sum(p) / 4 for p, _ in pairs) / len(pairs), sum(sum(c) / 4 for _, c in pairs) / len(pairs))
-
-
-def path_minimum(sources: list[str], means: list[tuple[float, float] | None]) -> int:
-    """Rule B over one lineage's checkpoints (sources[0] = the bottom, sources[-1] = the last module).
-    phi(bottom) = 0; a step that changed the module adds F(child) - F(parent) from its own selection (means[i - 1] for
-    checkpoint i); a step that kept it adds nothing. The pick is the lowest phi, the later checkpoint on a tie, then the
-    latest checkpoint holding the same module. Any changed step without both means keeps the last module."""
-    last = len(sources) - 1
-    phi = [0.0]
-    for i in range(1, last + 1):
-        if sources[i] == sources[i - 1]:
-            phi.append(phi[-1])
-            continue
-        step = means[i - 1] if i - 1 < len(means) else None
-        if step is None or len(step) != 2 or not all(x == x and abs(x) != float("inf") for x in step):
-            return last
-        phi.append(phi[-1] + (step[1] - step[0]))
-    best = min(phi)
-    pick = max(i for i in range(last + 1) if abs(phi[i] - best) < 1e-12)
-    while pick < last and sources[pick] == sources[pick + 1]:
-        pick += 1
-    return pick
-
-
 class Pipeline:
     def __init__(self, image: bytes, seed: int, calls: ModelCalls, renderer: Renderer) -> None:
         self.image = image
@@ -660,8 +596,6 @@ class Pipeline:
         self.astra_cap = ASTRA_MAX_OUTPUT
         self.photo: match.Appearance | None = None
         self.brief = ""
-        self.view_log: dict[int, list[dict[str, tuple[int, ...]]]] = {}  # per selection request id, see view_penalties
-        self.checkpoint_log: list[dict[str, Any]] = []
 
     # ----- model calls -----
 
@@ -948,46 +882,7 @@ class Pipeline:
                 ]
             calls.append(Call(request_id + offset, SOL, instructions, content, SELECT_EFFORT, SELECT_MAX_OUTPUT,
                               text=prompts.select_close_schema(list(labels))))
-        replies = self.run_stage(pool, calls)
-        judgements = self.parse_judgement(labels, replies)
-        self.view_log[request_id] = view_penalties(labels, replies)  # kept for the checkpoint pick; never raises
-        return judgements
-
-    def checkpoint_picks(self, plan: StagePlan, checkpoints: list[list[Candidate]],
-                         survivors: list[Candidate]) -> list[Candidate]:
-        """Rule B (path minimum) on each lineage's last checkpoints; run_stages takes the final pick's lineage only.
-        Checkpoint 0 is the lineage's module after step `plan.checkpoint_from`, then one per later step. Uses only the
-        step selections' saved scores (no call). A lineage with anything unknown keeps its last module."""
-        self.checkpoint_log = []
-        try:
-            first = plan.checkpoint_from
-            if plan.measured or first < 0 or first >= len(checkpoints) - 1 or len(checkpoints) != len(plan.steps):
-                return survivors
-            if any(not step.each_lineage or not (step.rewrites or step.lineage) for step in plan.steps[first + 1:]):
-                return survivors
-            if any(len(row) != len(survivors) for row in checkpoints[first:]):
-                return survivors
-            picked = list(survivors)
-            for position, last in enumerate(survivors):
-                chain = [row[position] for row in checkpoints[first:]]
-                if chain[-1] is not last:
-                    continue
-                means: list[tuple[float, float] | None] = []
-                for offset in range(1, len(chain)):
-                    parent, child = chain[offset - 1], chain[offset]
-                    if child.source == parent.source:
-                        means.append(None)  # no change: path_minimum does not read it
-                        continue
-                    replies = self.view_log.get(SELECT_ID + 10 * (first + offset + 1))
-                    means.append(front_means(replies, parent.name, child.name)
-                                 if replies is not None and child.parent is parent else None)
-                pick = path_minimum([c.source for c in chain], means)
-                picked[position] = chain[pick]
-                self.checkpoint_log.append({"lineage": position, "chain": [c.name for c in chain], "means": means,
-                                            "pick": pick})
-            return picked
-        except Exception:  # noqa: BLE001 - the rule is an addition: on any surprise the lineages stay as they are
-            return survivors
+        return self.parse_judgement(labels, self.run_stage(pool, calls))
 
     def select(self, pool: ThreadPoolExecutor, candidates: list[Candidate], parents: set[str], keep: int,
                request_id: int) -> list[Candidate]:
@@ -1085,18 +980,19 @@ class Pipeline:
                 survivors = self.drafts_kept(pool, survivors, plan)
                 self.best_so_far = survivors[0].source
             searched = False
-            checkpoints: list[list[Candidate]] = []  # each lineage's module after every step
             for index, step in enumerate(plan.steps):
                 survivors = self.advance(pool, survivors, step, index)
                 self.best_so_far = survivors[0].source
                 if plan.measured and len(survivors) == 1 and not searched:  # once only: the Pod has one render slot
                     survivors[0], searched = self.posed_by_search(pool, survivors[0]), True
-                checkpoints.append(list(survivors))
             winner = self.select(pool, survivors, set(), 1, FINAL_SELECT_ID)[0]
-            if plan.checkpoint_from >= 0:  # the final pick stays as it was; rule B then works inside the winner's lineage
-                picked = self.checkpoint_picks(plan, checkpoints, survivors)
-                winner = next((p for s, p in zip(survivors, picked) if s is winner), winner)
             self.best_so_far = winner.source
+            for index in range(len(plan.steps), len(plan.steps) + POST_PICK_STEPS):
+                kept = self.post_pick(pool, winner, index)
+                if kept is None:  # the budget refused the rewrite or it gave no valid module: nothing is scored, no more steps
+                    break
+                winner = kept
+                self.best_so_far = winner.source
             final = self.posed(pool, winner) if plan.pose and not plan.measured else winner
             return self.stronger_metal(self.photo_tilted(self.fitted_last(winner, plan)) if plan.outline_fit_last and final is winner else final.source)
 
@@ -1221,6 +1117,19 @@ class Pipeline:
             if child is not None:
                 newest[owner] = child
         return newest
+
+    def post_pick(self, pool: ThreadPoolExecutor, winner: Candidate, index: int) -> Candidate | None:
+        """One more rewrite of the final pick, judged against it as in an each_lineage step: the child is kept unless the
+        parent leads by PARENT_MARGIN. None when the budget refuses the rewrite or it yields no valid module: nothing is scored."""
+        model, effort = POST_PICK_REWRITE
+        call = self.rewrite_call(REWRITE_BASE * (index + 1), model, effort, winner)
+        child = self.modules(pool, [call], [f"r{index}.0.0"])[0]
+        if child is None:
+            return None
+        child.parent = winner
+        judgements = self.scores(pool, [child, winner], SELECT_ID + 10 * (index + 1))
+        mine, parent = judgements.get(child.name), judgements.get(winner.name)
+        return child if mine is not None and parent is not None and mine.score <= parent.score + PARENT_MARGIN else winner
 
     def posed(self, pool: ThreadPoolExecutor, incumbent: Candidate) -> Candidate:
         """Offer other poses to the selector: the photo-matching quarter turn, and standing a flat object up."""
